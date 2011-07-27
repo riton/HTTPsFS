@@ -36,12 +36,15 @@ class MyStat(fuse.Stat):
         self.st_ino = 0
         self.st_dev = 0
         self.st_nlink = 0
-        self.st_uid = 0
-        self.st_gid = 0
+        self.st_uid = 1000
+        self.st_gid = 1000
         self.st_size = 0
         self.st_atime = 0
         self.st_mtime = 0
         self.st_ctime = 0
+
+    def __str__(this):
+        return "mode: %d, n_link: %d, uid: size: %d" % (this.st_mode, this.st_nlink, this.st_size)
 
 """ Mapping of a FS object """
 class FSObject(object):
@@ -71,9 +74,9 @@ class FSObject(object):
 
     def getStatStruct(this):
         stats = this._stat_struct
-        stats.s_size = this.fs_size
-        stats.s_nlink = 1
-        stats.s_mode = this.fs_mode
+        stats.st_size = this.fs_size
+        stats.st_nlink = 1
+        stats.st_mode = this.fs_mode
         return stats
 
     def setAbsPath(this, path):
@@ -118,19 +121,19 @@ class HelloFS(Fuse):
 
         HelloFS.logger.debug(str(this))
 
-        name = "/dir1/file3"
-        hashed = HelloFS.hash_string(name)
-        HelloFS.logger.debug(str(this.__entries[hashed]))
+    """ Return a list of objects contained in directory which hash is dirhash """
+    def __getHashedDirectoryContent(this, dirhash):
+        return this.__directories[dirhash]
 
-        dirname = "/dir1"
-        hashed = HelloFS.hash_string(dirname)
-        for content in this.__directories[hashed]:
-            HelloFS.logger.debug(str(content) + "belongs to " + dirname)
+    """ Return a FSObject that matches entryhash """
+    def __getHashedEntry(this, entryhash):
+        return this.__entries[entryhash]
 
-        sys.exit(0)
+    """ Return if given hash is known in our tree """
+    def __hasHashedEntry(this, hash):
+        return this.__entries.has_key(hash)
 
-
-    """ Feed internal structures. Recursive """
+    """ Build internal tree structure mapping FileSystem in memory. Recursive """
     def _build_cache(this, entries, path = "/", parentHash = None):
 
         HelloFS.logger.debug("Entering function _build_cache")
@@ -180,43 +183,23 @@ class HelloFS(Fuse):
                 this.__directories[parentHash].append(fileObject) # Update parent directory content
 
 
-#    def getattr(this, path):
-#	HelloFS.logger.debug("getAttr[Path]: %s" % path)
-#
-#        st = MyStat()
-#
-#        if path == '/':
-#            st.st_mode = stat.S_IFDIR | 0755
-#            st.st_nlink = 1
-#        elif this._fs_structure[path] is not None:
-#            current = this._fs_structure[path]
-#            st.st_mode = current.getMode()
-#            st.st_nlink = 1
-#            st.st_size = current.getSize()
-#        else:
-#            return -errno.ENOENT
-#        return st
-
-
     def getattr(this, path):
         HelloFS.logger.debug("getAttr[Path]: %s" % path)
-        st = MyStat()
 
-        if path == "/":
-            st.st_mode = stat.S_IFDIR | 0755
-            st.st_nlink = 1
-            st.st_size = 4096
-        elif path == "/dir" or path == "/dir/sub_dir":
-            st.st_mode = stat.S_IFDIR | 0755
-            st.st_nlink = 1
-            st.st_size = 4096
-        elif path == "/dir/file1" or path == "/dir/sub_dir/file2":
-            st.st_mode = stat.S_IFREG | 0644
-            st.st_nlink = 1
-        else:
-            return -errno.ENOENT
+        hashed_path = HelloFS.hash_string(path)
+        HelloFS.logger.debug("getAttr[hash]: %s" % hashed_path)
+        entry = this.__getHashedEntry(hashed_path)
+        HelloFS.logger.debug("getAttr[entry]: %s" % str(entry))
 
-        return st
+        if entry is not None:
+            HelloFS.logger.debug("Found entry: " + str(entry))
+            stats = entry.getStatStruct()
+            HelloFS.logger.debug("Stats: " + str(stats))
+            return stats
+
+        HelloFS.logger.debug("No entry found")
+
+        return -errno.ENOENT
 
 
 #    def readdir(self, path, offset):
@@ -232,14 +215,20 @@ class HelloFS(Fuse):
 
     def readdir(this, path, offset):
 	HelloFS.logger.debug("readdir[path, offset]: '%s' '%d'" % (path, offset))
-        l = [".", ".."]
-        if path == "/":
-            l.extend(["dir"])
-        elif path == "/dir":
-            l.extend(["sub_dir", "file1"])
-        elif path == "/dir/sub_dir":
-            l.extend(["file2"])
-        for r in l:
+        content = [".", ".."]
+
+        hashed_path = HelloFS.hash_string(path)
+        dir_content = this.__getHashedDirectoryContent(hashed_path)
+
+        if dir_content is None:
+            raise ValueError("No such hash in tree")
+    
+        for entry in dir_content:
+            content.append(entry.getName())
+
+        HelloFS.logger.debug("Content: " + str(content))
+
+        for r in content:
             yield fuse.Direntry(name = r, offset = offset, type = stat.S_IFDIR)
 
     def open(self, path, flags):
