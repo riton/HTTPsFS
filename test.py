@@ -11,6 +11,7 @@ import unicodedata
 import time
 import re
 import httplib
+import urllib
 import json
 import random
 import logging
@@ -92,8 +93,8 @@ class FSObject(object):
         this.fs_size = fs_size
         this.fs_abspath = fs_abspath
         this.fs_name = fs_name
+        this.fs_uri = fs_uri
         this._stat_struct = MyStat()
-        this.fs_uri = "" # TODO
 
     def getMode(this):
         return this.fs_mode
@@ -133,7 +134,7 @@ class FSObject(object):
         return this.fs_mode & stat.S_IFREG
 
     def __str__(this):
-        return "FS_mode: '%d', FS_size: '%d', FS_name: '%s', FS_abspath: '%s', FS_parent: '%s'" % (this.fs_mode, this.fs_size, this.fs_name, this.fs_abspath, this.fs_parent)
+        return "FS_mode: '%d', FS_size: '%d', FS_name: '%s', FS_abspath: '%s', FS_URI: '%s', FS_parent: '%s'" % (this.fs_mode, this.fs_size, this.fs_name, this.fs_abspath, this.fs_uri, this.fs_parent)
 
 
 class HelloFS(Fuse):
@@ -145,7 +146,6 @@ class HelloFS(Fuse):
 
     @classmethod
     def hash_string(cls, string):
-        Logger.debug("HASH_STRING::String: " + string)
         return hashlib.sha1(string).hexdigest()
 
     def __init__(this, dir_structure, *args, **kw):
@@ -224,6 +224,8 @@ class HelloFS(Fuse):
                 Logger.debug("Filename: %s" % filename)
                 Logger.debug("FileURI: %s" % fileuri)
                 file_name = HelloFS.normalize_unicode(filename)
+                file_uri = urllib.unquote(fileuri)
+                Logger.debug("URI: '%s', unquoted: '%s'" % (fileuri, file_uri))
                 Logger.debug("Filename decode: %s" % file_name)
                 slash = ""
                 if not path[-1] == "/":
@@ -233,7 +235,7 @@ class HelloFS(Fuse):
 
                 HelloFS.logger.debug("Dealing with file '%s' which is hashed to '%s'" % (abspath, hashed_filename))
 
-                fileObject = FSObject(fs_mode = stat.S_IFREG | 0644, fs_size = filesize, fs_abspath = abspath, fs_name = file_name, fs_uri = fileuri, fs_parent = parentHash)
+                fileObject = FSObject(fs_mode = stat.S_IFREG | 0644, fs_size = filesize, fs_abspath = abspath, fs_name = file_name, fs_uri = file_uri, fs_parent = parentHash)
                 this.__entries[hashed_filename] = fileObject # Update collection
                 this.__directories[parentHash].append(fileObject) # Update parent directory content
 
@@ -242,16 +244,15 @@ class HelloFS(Fuse):
         HelloFS.logger.debug("getAttr[Path]: %s" % path)
 
         hashed_path = HelloFS.hash_string(path)
-        HelloFS.logger.debug("getAttr[hash]: %s" % hashed_path)
         entry = this.__getHashedEntry(hashed_path)
-        HelloFS.logger.debug("getAttr[entry]: %s" % str(entry))
+        #HelloFS.logger.debug("getAttr[entry]: %s" % str(entry))
 
         if entry is not None:
             stats = entry.getStatStruct()
-            HelloFS.logger.debug("Stats: " + str(stats))
+            #HelloFS.logger.debug("Stats: " + str(stats))
             return stats
 
-        HelloFS.logger.debug("No entry found")
+        Logger.error("getattr(): No entry found")
 
         return -errno.ENOENT
 
@@ -274,26 +275,41 @@ class HelloFS(Fuse):
         for r in content:
             yield fuse.Direntry(name = r, offset = offset, type = stat.S_IFDIR)
 
-    def open(self, path, flags):
+    def open(this, path, flags):
 	HelloFS.logger.debug("open[path, flags] : %s %d" % (path, flags))
-        if path != hello_path:
+
+        hashed_path = HelloFS.hash_string(path)
+        fsobject = this.__getHashedEntry(hashed_path)
+        if fsobject is None:
+            HelloFS.logger.error("open[path] path '%s' not found in tree" % path)
             return -errno.ENOENT
+	
+        HelloFS.logger.debug("read[path, size, offset]: Object is found in local tree")
+
+        if fsobject.isDir():
+            Logger.warning("This is a dir... stange for a open()")
+
         accmode = os.O_RDONLY | os.O_WRONLY | os.O_RDWR
         if (flags & accmode) != os.O_RDONLY:
             return -errno.EACCES
 
-    def read(self, path, size, offset):
+    def read(this, path, size, offset):
 	HelloFS.logger.debug("read[path, size, offset] : %s %d %d" % (path, size, offset))
-        if path != hello_path:
+        hashed_path = HelloFS.hash_string(path)
+        fsobject = this.__getHashedEntry(hashed_path)
+
+        if fsobject is None:
             return -errno.ENOENT
-        slen = len(hello_str)
-        if offset < slen:
-            if offset + size > slen:
-                size = slen - offset
-            buf = hello_str[offset:offset+size]
-        else:
-            buf = ''
-        return buf
+
+	HelloFS.logger.debug("read[path, size, offset]: Object is found in local tree")
+        uri = fsobject.getUri()
+        if offset >= fsobject.getSize():
+            return ""
+        Logger.debug("Remote URI is: '%s'" % uri)
+        Logger.debug("Remote object is: '%s'" % str(fsobject))
+        read = RemoteFSoverHTTPs.readuri(fsobject.getUri(), size, offset)
+        Logger.debug("read(): length: %d" % len(read))
+        return read
 
 def getRandomSize(upperLimit = 5092):
     return random.randrange(upperLimit)
@@ -344,6 +360,38 @@ class RemoteFSoverHTTPs(object):
             return this._update()
         return this.__fs_mapping
 
+    @classmethod
+    def readuri(cls, uri, size, offset):
+        Logger.debug("readuri(uri, size, offset): '%s', %d, %d" % (uri, size, offset))
+
+        if size > 1024:
+            Logger.warning("readuri(): Changing read() size to 1024")
+            size = 1024
+
+        conn = httplib.HTTPSConnection(
+                host = "media.riton.fr",
+                key_file = "/home/riton/.certs/riton.key",
+                cert_file = "/home/riton/.certs/riton.crt",
+        )
+        match = re.search("^https://media.riton.fr(.*)", uri)
+        conn.putrequest("GET", match.group(1))
+        if offset != 0:
+            Logger.error("Using range: %d - %d" % (offset, offset + size))
+            conn.putheader("Range", "bytes=%d-%d" % (offset, offset + size))
+        conn.endheaders()
+        response = conn.getresponse()
+        if response.status == httplib.REQUESTED_RANGE_NOT_SATISFIABLE:
+            Logger.error("readuri(): Error response status: %d" % response.status)
+            return -errno.ERANGE
+        elif response.status != httplib.PARTIAL_CONTENT and response.status != httplib.OK:
+            Logger.error("readuri(): Error response status: %d" % response.status)
+            return -errno.ENOENT
+
+        Logger.debug("readuri() will return")
+
+        return response.read()
+
+
 
 
 def main():
@@ -366,7 +414,8 @@ def main():
 
     fs_map = remoteFS.getRemoteFSMap()
 
-    print str(fs_map)
+    Logger.logger.setLevel(logging.DEBUG)
+    #Logger.logger.setLevel(logging.INFO)
 
     usage="""
 Userspace hello example
