@@ -7,6 +7,11 @@
 #
 
 import hashlib
+import unicodedata
+import time
+import re
+import httplib
+import json
 import random
 import logging
 import logging.handlers
@@ -30,6 +35,38 @@ fuse.fuse_python_api = (0, 2)
 hello_path = '/hello'
 hello_str = 'Hello World!\n'
 
+class Logger(object):
+
+    logger = logging.getLogger()
+    logger.addHandler(logging.handlers.SysLogHandler(address = "/dev/log", facility = logging.handlers.SysLogHandler.LOG_USER))
+    logger.setLevel(logging.DEBUG)
+
+    @classmethod
+    def debug(cls, msg):
+        global logger
+        cls.logger.debug(msg)
+
+    @classmethod
+    def error(cls, msg):
+        global logger
+        cls.logger.error(msg)
+
+    @classmethod
+    def info(cls, msg):
+        global logger
+        cls.logger.info(msg)
+
+    @classmethod
+    def warning(cls, msg):
+        global logger
+        cls.logger.warning(msg)
+
+    @classmethod
+    def log(cls, level, msg):
+        global logger
+        cls.logger.log(level, msg)
+
+
 class MyStat(fuse.Stat):
     def __init__(self):
         self.st_mode = 0
@@ -49,13 +86,14 @@ class MyStat(fuse.Stat):
 """ Mapping of a FS object """
 class FSObject(object):
 
-    def __init__(this, fs_mode, fs_size, fs_name, fs_abspath = "", fs_parent = None):
+    def __init__(this, fs_mode, fs_size, fs_name, fs_abspath = "", fs_uri = "", fs_parent = None):
         this.fs_parent = fs_parent
         this.fs_mode = fs_mode
         this.fs_size = fs_size
         this.fs_abspath = fs_abspath
         this.fs_name = fs_name
         this._stat_struct = MyStat()
+        this.fs_uri = "" # TODO
 
     def getMode(this):
         return this.fs_mode
@@ -78,6 +116,9 @@ class FSObject(object):
         stats.st_nlink = 1
         stats.st_mode = this.fs_mode
         return stats
+
+    def getUri(this):
+        return this.fs_uri
 
     def setAbsPath(this, path):
         this.fs_abspath = path
@@ -104,6 +145,7 @@ class HelloFS(Fuse):
 
     @classmethod
     def hash_string(cls, string):
+        Logger.debug("HASH_STRING::String: " + string)
         return hashlib.sha1(string).hexdigest()
 
     def __init__(this, dir_structure, *args, **kw):
@@ -133,6 +175,11 @@ class HelloFS(Fuse):
     def __hasHashedEntry(this, hash):
         return this.__entries.has_key(hash)
 
+    @classmethod
+    def normalize_unicode(cls, u):
+        if type(u) is str: return u
+        return unicodedata.normalize("NFKD", u).encode("ascii", "ignore")
+
     """ Build internal tree structure mapping FileSystem in memory. Recursive """
     def _build_cache(this, entries, path = "/", parentHash = None):
 
@@ -152,10 +199,14 @@ class HelloFS(Fuse):
                 HelloFS.logger.debug("Entry '%s' is a dictionnary" % entry)
                 dirname = entry.keys()[0] # Dir name we're dealing with
                 HelloFS.logger.debug("Dealing with directory '%s'" % dirname)
+                if type(dirname) is unicode:
+                    dirname = HelloFS.normalize_unicode(dirname)
+                    HelloFS.logger.debug("Dealing with directory normalized '%s'" % dirname)
                 slash = ""
                 if not path[-1] == "/":
                     slash = "/"
                 abspath = path + slash + dirname
+                abspath = HelloFS.normalize_unicode(abspath)
                 hashed_dirname = HelloFS.hash_string(abspath)
 
                 HelloFS.logger.debug("Dealing with absolute path '%s' which is hashed to '%s'" % (abspath, hashed_dirname))
@@ -169,16 +220,20 @@ class HelloFS(Fuse):
             # File    
             else:
                 HelloFS.logger.debug("Entry: '%s'" % entry)
-                (filename, filesize) = entry
+                (filename, filesize, fileuri) = entry
+                Logger.debug("Filename: %s" % filename)
+                Logger.debug("FileURI: %s" % fileuri)
+                file_name = HelloFS.normalize_unicode(filename)
+                Logger.debug("Filename decode: %s" % file_name)
                 slash = ""
                 if not path[-1] == "/":
                     slash = "/"
-                abspath = path + slash + filename
+                abspath = path + slash + file_name
                 hashed_filename = HelloFS.hash_string(abspath)
 
                 HelloFS.logger.debug("Dealing with file '%s' which is hashed to '%s'" % (abspath, hashed_filename))
 
-                fileObject = FSObject(fs_mode = stat.S_IFREG | 0644, fs_size = filesize, fs_abspath = abspath, fs_name = filename, fs_parent = parentHash)
+                fileObject = FSObject(fs_mode = stat.S_IFREG | 0644, fs_size = filesize, fs_abspath = abspath, fs_name = file_name, fs_uri = fileuri, fs_parent = parentHash)
                 this.__entries[hashed_filename] = fileObject # Update collection
                 this.__directories[parentHash].append(fileObject) # Update parent directory content
 
@@ -192,7 +247,6 @@ class HelloFS(Fuse):
         HelloFS.logger.debug("getAttr[entry]: %s" % str(entry))
 
         if entry is not None:
-            HelloFS.logger.debug("Found entry: " + str(entry))
             stats = entry.getStatStruct()
             HelloFS.logger.debug("Stats: " + str(stats))
             return stats
@@ -201,17 +255,6 @@ class HelloFS(Fuse):
 
         return -errno.ENOENT
 
-
-#    def readdir(self, path, offset):
-#	HelloFS.logger.debug("readdir[path, offset]: %s %d" % (path, offset))
-#        l = ['.', '..']
-#        for entry in self._fs_structure.keys():
-#            l.append(entry[1:])
-#        for i in l:
-#            HelloFS.logger.debug(str(i))
-#        for r in  l:
-#            yield fuse.Direntry(name = r, offset = offset, type = stat.S_IFDIR)
-#
 
     def readdir(this, path, offset):
 	HelloFS.logger.debug("readdir[path, offset]: '%s' '%d'" % (path, offset))
@@ -224,7 +267,7 @@ class HelloFS(Fuse):
             raise ValueError("No such hash in tree")
     
         for entry in dir_content:
-            content.append(entry.getName())
+            content.append(str(entry.getName().decode("ascii", "ignore")))
 
         HelloFS.logger.debug("Content: " + str(content))
 
@@ -255,6 +298,54 @@ class HelloFS(Fuse):
 def getRandomSize(upperLimit = 5092):
     return random.randrange(upperLimit)
 
+class RemoteFSoverHTTPs(object):
+    def __init__(this, host = "media.riton.fr", uri = "/json.php", use_keep_alive = False, http_debug_level = 0, update_delay = 10, **x509):
+        this.host = host
+        this.uri = uri
+        this.use_keep_alive = use_keep_alive
+        this.http_debug_level = http_debug_level
+        this.x509 = x509
+        this.update_delay = update_delay
+        this.__json_decoder = json.JSONDecoder()
+        this.__fs_mapping = []
+        this.__last_update_time = 0
+
+    def __need_update(this):
+        if int(time.time()) - this.__last_update_time >= int(this.update_delay):
+            Logger.debug("Cache needs to be updated")
+            return True
+        Logger.debug("Cache is up to date")
+        return False
+
+    def _update(this):
+        Logger.info("Refreshing remote FS cache")
+        conn = httplib.HTTPSConnection(
+                host = this.host,
+                key_file = this.x509["key_file"],
+                cert_file = this.x509["cert_file"]
+        )
+        conn.set_debuglevel(this.http_debug_level)
+        conn.putrequest('GET', this.uri)
+        if this.use_keep_alive == True:
+            conn.putheader("Connection", "keep-alive")
+        conn.endheaders()
+        response = conn.getresponse()
+        body = response.read()
+
+        obj = this.__json_decoder.decode(body)
+
+        (root, content) = obj.popitem()
+        this.__fs_mapping = content
+        this.__last_update_time = int(time.time())
+        return content
+
+    def getRemoteFSMap(this):
+        if this.__need_update():
+            return this._update()
+        return this.__fs_mapping
+
+
+
 def main():
 
     directory_structure = [
@@ -270,11 +361,18 @@ def main():
         ]},
     ]
 
+    remoteFS = RemoteFSoverHTTPs(key_file = "/home/riton/.certs/riton.key", cert_file = "/home/riton/.certs/riton.crt")
+
+
+    fs_map = remoteFS.getRemoteFSMap()
+
+    print str(fs_map)
+
     usage="""
 Userspace hello example
 
 """ + Fuse.fusage
-    server = HelloFS(dir_structure = directory_structure, version="%prog " + fuse.__version__, usage=usage, dash_s_do='setsingle')
+    server = HelloFS(dir_structure = fs_map, version="%prog " + fuse.__version__, usage=usage, dash_s_do='setsingle')
     server.parse(errex=1)
     server.main()
 
